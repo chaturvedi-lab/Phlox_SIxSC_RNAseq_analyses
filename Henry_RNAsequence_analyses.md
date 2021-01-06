@@ -1,9 +1,3 @@
----
-title: Henry_RNA_sequence_Analyses
-created: '2020-08-10T17:36:27.342Z'
-modified: '2020-08-25T18:04:06.946Z'
----
-
 Henry RNA sequence - Analyses
 
 This is a pipeline to run RNA sequence analyses. I start with filtering of reads, adapter trimming, filtering of transcripts based on annotation and then preparing a gene expression count matrix for differential expression analyses.
@@ -405,4 +399,67 @@ mv /n/holyscratch01/hopkins_lab/Chaturvedi/trim_galore/trimmed_reads/*quant /n/h
 
 ```
 
-Now run Grouper. (SAM is HERE)
+On Jan 6th 2020
+Adam suggested to rerun salmon with the following comments: So .. perhaps do two salmon runs, both with --dumpEq, and one with and the other without orphan reads. To integrate orphan reads with salmon you need to provide salmon the --writeOrphanLinks argument.
+
+Here are the scripts for the new runs:
+
+```bash
+#!/bin/bash
+#SBATCH -J salmon
+#SBATCH -n 16                     # Use 1 cores for the job
+#SBATCH -N 1                    # Ensure that all cores are on one machine
+#SBATCH -t 6-00:00                 # Runtime in D-HH:MM
+#SBATCH -p shared         # Partition to submit to
+#SBATCH --mem=100000               # Memory pool for all cores (see also --mem-per-cpu)
+#SBATCH -o salmon_ind.%A.out  # File to which STDOUT will be written
+#SBATCH -e salmon_ind.%A.err  # File to which STDERR will be written
+#SBATCH --mail-type=ALL           # Type of email notification- BEGIN,END,FAIL,ALL
+#SBATCH --mail-user=schaturvedi@fas.harvard.edu # Email to send notifications to
+
+
+
+module purge
+module load salmon/0.12.0-fasrc01
+
+for prefix in $(ls /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trimmed_filtered_seqs/unfixrm_Henry_*001.cor_val_*.fq | sed -r 's/_R[12]_001[.]cor_val_[12].fq//' | uniq)
+
+do
+
+salmon quant -i phlox_salmon_index -l A -1 "${prefix}_R1_001.cor_val_1.fq" -2 "${prefix}_R2_001.cor_val_2.fq" -p 8 --validateMappings --dumpEq -o ${prefix}_quant
+
+done
+
+mv ls /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trimmed_filtered_seqs/*quant /n/holyscratch01/hopkins_lab/Chaturvedi/salmon/salmon_quant_run2/
+```
+
+```bash
+#!/bin/bash
+#SBATCH -J salmon3
+#SBATCH -n 16                     # Use 1 cores for the job
+#SBATCH -N 1                    # Ensure that all cores are on one machine
+#SBATCH -t 6-00:00                 # Runtime in D-HH:MM
+#SBATCH -p shared         # Partition to submit to
+#SBATCH --mem=100000               # Memory pool for all cores (see also --mem-per-cpu)
+#SBATCH -o salmon_ind3.%A.out  # File to which STDOUT will be written
+#SBATCH -e salmon_ind3.%A.err  # File to which STDERR will be written
+#SBATCH --mail-type=ALL           # Type of email notification- BEGIN,END,FAIL,ALL
+#SBATCH --mail-user=schaturvedi@fas.harvard.edu # Email to send notifications to
+
+
+
+module purge
+module load salmon/0.12.0-fasrc01
+
+for prefix in $(ls /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trimmed_filtered_seqs/unfixrm_Henry_*001.cor_val_*.fq | sed -r 's/_R[12]_001[.]cor_val_[12].fq//' | uniq)
+
+do
+
+salmon quant -i phlox_salmon_index -l A -1 "${prefix}_R1_001.cor_val_1.fq" -2 "${prefix}_R2_001.cor_val_2.fq" -p 8 --validateMappings --dumpEq --writeOrphanLinks -o ${prefix}_quant
+
+done
+
+mv ls /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trimmed_filtered_seqs/*quant /n/holyscratch01/hopkins_lab/Chaturvedi/salmon/salmon_quant_run3/
+```
+
+SAM IS HERE

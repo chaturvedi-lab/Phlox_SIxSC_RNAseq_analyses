@@ -1,0 +1,610 @@
+---
+title: Phlox denovo transcriptome annotation
+created: '2021-01-28T18:22:09.341Z'
+modified: '2021-02-09T21:18:59.296Z'
+---
+
+# Phlox denovo transcriptome annotation
+
+## Functional annotation of transcripts and dropping transcripts with lower hits from the analyses
+
+**1. Software required**
+
+Download and uncompress Trinotate code:
+
+```bash
+wget https://github.com/Trinotate/Trinotate/archive/v2.0.2.tar.gz -O Trinotate-2.0.2.tar.gz
+tar xvf Trinotate-2.0.2.tar.gz
+```
+
+You can mark the location of the Trinotate directory with an environment variable, for easy reference:
+```bash
+export TRINOTATE_HOME=/path/to/trinotate/Trinotate-2.0.2
+```
+
+Other software programs needed are already installed on the Odyssey cluster and can be loaded as modules. Remember, if using modules of the Lmod system, that the following command is required:
+
+```bash
+source new-modules.sh
+```
+
+Programs like NCBI BLAST+ and HMMER can be loaded like:
+
+```bash
+module load blast/2.2.29+-fasrc03
+module load hmmer/3.1b2-fasrc01
+```
+
+SQLite (required for Trinotate database integration) is also already installed on the cluster.
+
+TransDecoder, a program that finds coding regions within transcripts and returns the most likely longest-ORF peptide candidates, is also needed to preprocess the transcriptome data. This is already installed in the Lmod module system and can be loaded with:
+
+```bash
+module load TransDecoder/2.0.1-fasrc01
+```
+
+**2. Databases required**
+
+Trinotate uses customized versions SwissProt and Pfam databases. These can be downloaded from the Trinotate website into the $TRINOTATE_HOME folder created above:
+
+```bash
+$ wget https://data.broadinstitute.org/Trinity/Trinotate_v3_RESOURCES/Trinotate_v2.0_RESOURCES/uniprot_sprot.trinotate_v2.0.pep.gz
+$ wget https://data.broadinstitute.org/Trinity/Trinotate_v3_RESOURCES/Trinotate_v2.0_RESOURCES/Pfam-A.hmm.gz
+```
+
+To rename, uncompress and index the SwissProt database for Blast use:
+
+```bash
+$ mv uniprot_sprot.trinotate_v2.0.pep.gz uniprot_sprot.trinotate.pep.gz
+$ gunzip uniprot_sprot.trinotate.pep.gz
+$ makeblastdb -in uniprot_sprot.trinotate.pep -dbtype prot
+```
+
+The Blast indexing should take about a minute and will create .phr, .pin, .psq files
+
+To uncompress and prepare the Pfam database for use with 'hmmscan' do:
+
+```bash
+$ gunzip Pfam-A.hmm.gz
+$ hmmpress Pfam-A.hmm
+#This should take 2-3 minutes.
+```
+
+Finally, retrieve and uncompress the latest Trinotate pre-generated resource SQLite database, which contains Uniprot(SwissProt and Uniref90)-related annotation information:
+
+```bash
+$ wget "https://data.broadinstitute.org/Trinity/Trinotate_v3_RESOURCES/Trinotate_v2.0_RESOURCES/Trinotate.sprot_uniref90.20150131.boilerplate.sqlite.gz" -O Trinotate.sqlite.gz
+$ gunzip Trinotate.sqlite.gz
+```
+
+Place the Trinotate.sqlite database in the working directory. Create a separate working directory for this example, for data and results files, running jobs, etc., preferably on the /n/regal file system, which is recommended for SLURM jobs, especially if there is a lot of I/O or large files are written out during jobs.
+
+A tab-delimited text file indicating the Gene/Transcript relationships (format: "gene_id(tab)transcript_id"), is also needed for Trinotate. Since, I am using the Trinity assemblies, I generated this file using a Trinity script. I have named this file "gene_transcript_map.txt".
+
+I used the following script to create this file:
+
+```bash
+#!/bin/bash 
+#SBATCH -N 1
+#SBATCH -n 16
+#SBATCH -p shared                  # may consider running on a bigmem node for large dataset
+#SBATCH -e trinity_%A.err            # File to which STDERR will be written
+#SBATCH -o trinity_%A.out           # File to which STDOUT will be written
+#SBATCH -J trinity_%A               # Job name
+#SBATCH --mem=150000                 # Memory requested
+#SBATCH --time=7-00:00              # Runtime in D-HH:MM:SS
+#SBATCH --mail-type=ALL              # Type of email notification- BEGIN,END,FAIL,ALL
+#SBATCH --mail-user=schaturvedi@fas.harvard.edu # Email to send notifications to
+
+
+module load trinity/2.8.5-fasrc01
+module load rsem/1.2.29-fasrc03
+module load bowtie/1.1.1-fasrc01
+module load samtools/1.5-fasrc02
+
+
+${TRINITY_HOME}/util/support_scripts/get_Trinity_gene_to_trans_map.pl /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trinity/Trinity_assembly/Trinity.fasta > gene_transcript_map.txt
+
+```
+
+The path to this file is: /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trinity/gene_transcript_map.txt
+
+*After running transdecoder, I ran the blast again against the trinotate databases. Scroll down to the Trinotate section for the pipeline.*
+
+**3. TRANSDECODER (read more here: https://github.com/TransDecoder/TransDecoder/wiki)**
+
+*The files for this analyses are: /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/transdecoder/*
+
+TransDecoder identifies candidate coding regions within transcript sequences, such as those generated by de novo RNA-Seq transcript assembly using Trinity, or constructed based on RNA-Seq alignments to the genome using Tophat and Cufflinks.
+
+TransDecoder identifies likely coding sequences based on the following criteria:
+
+a. a minimum length open reading frame (ORF) is found in a transcript sequence
+
+b. a log-likelihood score similar to what is computed by the GeneID software is > 0. The above coding score is greatest when the ORF is scored in the 1st reading frame as compared to scores in the other 2 forward reading frames.
+
+c. If a candidate ORF is found fully encapsulated by the coordinates of another candidate ORF, the longer one is reported. However, a single transcript can report multiple ORFs (allowing for operons, chimeras, etc).
+d. a PSSM is built/trained/used to refine the start codon prediction.
+
+e. optional the putative peptide has a match to a Pfam domain above the noise cutoff score.
+
+Here is the bash script I used to run Transdecoder on the cluster:
+
+```bash
+
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH -n 16
+#SBATCH -p shared                   # may consider running on a bigmem node for large dataset
+#SBATCH -e transdec_%A.err            # File to which STDERR will be written
+#SBATCH -o transdec_%A.out           # File to which STDOUT will be written
+#SBATCH -J transdec_%A               # Job name
+#SBATCH --mem=150000                 # Memory requested
+#SBATCH --time=7-00:00              # Runtime in D-HH:MM:SS
+#SBATCH --mail-type=ALL              # Type of email notification- BEGIN,END,FAIL,ALL
+#SBATCH --mail-user=schaturvedi@fas.harvard.edu # Email to send notifications to
+
+
+
+module load TransDecoder/5.3.0-fasrc01
+
+#Running TransDecoder is a two-step process. First run the TransDecoder step that identifies all long ORFs.
+
+$TRANSDECODER_HOME/TransDecoder.LongOrfs -t /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trinity/Trinity_assembly/Trinity.fasta
+
+#Now, run the step that predicts which ORFs are likely to be coding.
+
+$TRANSDECODER_HOME/TransDecoder.Predict -t /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trinity/Trinity_assembly/Trinity.fasta
+
+```
+
+You'll now find a number of output files containing 'transdecoder' in their name:
+
+```bash
+ls -1 |grep transdecoder
+
+Trinity.fasta.transdecoder.bed
+Trinity.fasta.transdecoder.cds
+Trinity.fasta.transdecoder.gff3
+Trinity.fasta.transdecoder.mRNA
+Trinity.fasta.transdecoder.pep    
+Trinity.fasta.transdecoder_dir/
+```
+
+The file we care about the most here is the 'Trinity.fasta.transdecoder.pep' file, which contains the protein sequences corresponding to the predicted coding regions within the transcripts.
+
+**3a. Sequence homology searches using transdecoder output with blastx and blastp**
+
+Earlier, I ran blastx against our mini SWISSPROT phlox database to identify likely full-length transcripts. I am running blastx again to capture likely homolog information, and I'll lower our E-value threshold to 1e-5 to be less stringent than earlier.
+
+First create a database for the pep file created by transdecoder
+
+```
+makeblastdb -in ./Trinity.fasta.transdecoder.pep -dbtype prot
+```
+
+Then run blastx using the transdecoder output.
+
+```bash
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH -n 16
+#SBATCH -p shared                   # may consider running on a bigmem node for large dataset
+#SBATCH -e blastx_%A.err            # File to which STDERR will be written
+#SBATCH -o blastx_%A.out           # File to which STDOUT will be written
+#SBATCH -J blastx_%A               # Job name
+#SBATCH --mem=150000                 # Memory requested
+#SBATCH --time=7-00:00              # Runtime in D-HH:MM:SS
+#SBATCH --mail-type=ALL              # Type of email notification- BEGIN,END,FAIL,ALL
+#SBATCH --mail-user=schaturvedi@fas.harvard.edu # Email to send notifications to
+
+
+module load blast/2.6.0+-fasrc01
+
+blastx -db ../transdecoder/Trinity.fasta.transdecoder.pep \
+         -query /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trinity/Trinity_assembly/Trinity.fasta \ -num_threads 12 \
+         -max_target_seqs 1 -outfmt 6 -evalue 1e-5 \
+          > td_swissprot.blastx.outfmt6
+```
+
+Now, let's look for sequence homologies by just searching our predicted protein sequences rather than using the entire transcript as a target. To do this I ran blastp. For this I first downloaded the uniprot_sprot fasta file as follows:
+
+```bash
+mkdir uniprot_sprot
+
+URL=ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
+URL=ftp://ftp.ebi.ac.uk/pub/databases/uniprot/knowledgebase/uniprot_sprot.fasta.gz
+
+wget -b $URL
+wget -nv -P data/ $URL
+gunzip -c uniprot_sprot.fasta.gz > uniprot_sprot.fasta
+
+#make database of the fasta for next step
+makeblastdb -in ./uniprot_sprot.fasta -dbtype prot
+```
+
+Then I ran blastp using the following bash script:
+
+```bash
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH -n 16
+#SBATCH -p shared                   # may consider running on a bigmem node for large dataset
+#SBATCH -e blastp_%A.err            # File to which STDERR will be written
+#SBATCH -o blastp_%A.out           # File to which STDOUT will be written
+#SBATCH -J blastp_%A               # Job name
+#SBATCH --mem=150000                 # Memory requested
+#SBATCH --time=7-00:00              # Runtime in D-HH:MM:SS
+#SBATCH --mail-type=ALL              # Type of email notification- BEGIN,END,FAIL,ALL
+#SBATCH --mail-user=schaturvedi@fas.harvard.edu # Email to send notifications to
+
+
+module load blast/2.6.0+-fasrc01
+
+blastp -query /n/holyscratch01/hopkins_lab/Chaturvedi/transdecoder/Trinity.fasta.transdecoder.pep -db /n/holyscratch01/hopkins_lab/Chaturvedi/transdecoder/blastp/uniprot_sprot/uniprot_sprot.fasta -num_threads 10 -max_target_seqs 1 -outfmt 6 -evalue 1e-5 > td_uniprot.blastp.outfmt6
+
+```
+Output format:
+
+Column headers:
+qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore
+
+ 1.	 qseqid	 query (e.g., unknown gene) sequence id
+ 2.	 sseqid	 subject (e.g., reference genome) sequence id
+ 3.	 pident	 percentage of identical matches
+ 4.	 length	 alignment length (sequence overlap)
+ 5.	 mismatch	 number of mismatches
+ 6.	 gapopen	 number of gap openings
+ 7.	 qstart	 start of alignment in query
+ 8.	 qend	 end of alignment in query
+ 9.	 sstart	 start of alignment in subject
+ 10. send	 end of alignment in subject
+ 11. evalue	 expect value
+ 12. bitscore	 bit score
+
+ **4. TRINOTATE**
+
+*It would be a good idea to run these searches in a separate working directory.*
+
+>*A. BLASTX of transcript nucleotide sequences against SwissProt. Run as a SLURM job array for the transcript fasta volumes.* 
+
+I split the transcriptome in several files to run the analyses in parallel quickly using the perl script split_fasta.pl:
+
+```bash
+perl split_fasta.pl /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trinity/Trinity_assembly/Trinity.fasta  trinity_phlox.vol  10000
+```
+
+The script is:
+
+```bash
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH -n 8
+#SBATCH -p serial_requeue                   # may consider running on a bigmem node for large dataset
+#SBATCH -e blastx_%A_%a.err            # File to which STDERR will be written
+#SBATCH -o blastx_%A_%a.out           # File to which STDOUT will be written
+#SBATCH --array=1-10               # Job name
+#SBATCH --mem=5000                 # Memory requested
+#SBATCH --time=7-00:00              # Runtime in D-HH:MM:SS
+#SBATCH --mail-type=ALL              # Type of email notification- BEGIN,END,FAIL,ALL
+#SBATCH --mail-user=schaturvedi@fas.harvard.edu # Email to send notifications to
+
+source new-modules.sh
+module load blast/2.2.29+-fasrc03
+
+TRANS_DATA=/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate
+TRINOTATE_HOME=/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate
+
+blastx -query $TRANS_DATA/trinity_phlox.vol.${SLURM_ARRAY_TASK_ID}.fasta  -db $TRINOTATE_HOME/uniprot_sprot.trinotate.pep -num_threads 8 -max_target_seqs 1 -outfmt 6 > blastx_trinotate_vol_${SLURM_ARRAY_TASK_ID}.outfmt6
+```
+
+Then combine output for each volume:
+```bash
+cat blastx_trinotate_vol_*.outfmt6 > blastx_sprot.outfmt6
+```
+
+>*B. BLASTp of transcoder peptide sequences against SwissProt. Run as a SLURM job array for the transcript fasta volumes.* 
+
+Blast the split up transdecoder peptide files against trinotate.
+
+```bash
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH -n 8
+#SBATCH -p serial_requeue                   # may consider running on a bigmem node for large dataset
+#SBATCH -e blastp_%A_%a.err            # File to which STDERR will be written
+#SBATCH -o blastp_%A_%a.out           # File to which STDOUT will be written
+#SBATCH --array=1-9               # Job name
+#SBATCH --mem=5000                 # Memory requested
+#SBATCH --time=1000              # Runtime in D-HH:MM:SS
+#SBATCH --mail-type=ALL              # Type of email notification- BEGIN,END,FAIL,ALL
+#SBATCH --mail-user=schaturvedi@fas.harvard.edu # Email to send notifications to
+
+source new-modules.sh
+module load blast/2.2.29+-fasrc03
+
+TRANS_DATA=/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate
+TRINOTATE_HOME=/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate
+
+blastp -query $TRANS_DATA/transdecoder_pep.vol.${SLURM_ARRAY_TASK_ID}.fasta  -db $TRINOTATE_HOME/uniprot_sprot.trinotate.pep -num_threads 8 -max_target_seqs 1 -outfmt 6 > blastp_trinotate_vol_${SLURM_ARRAY_TASK_ID}.outfmt6
+
+```
+
+Combine output for each volume:
+```bash
+cat blastp_trinotate_vol_*.outfmt6 > blastp_sprot.outfmt6
+```
+
+>*C. Run HMMER against Pfam to identify protein domains; run as a SLURM job*
+
+```bash
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH -n 8
+#SBATCH -p shared                   # may consider running on a bigmem node for large dataset
+#SBATCH -e hmm_%A.err            # File to which STDERR will be written
+#SBATCH -o hmm_%A.out           # File to which STDOUT will be written
+#SBATCH --mem=15000                 # Memory requested
+#SBATCH --time=7-00:00              # Runtime in D-HH:MM:SS
+#SBATCH --mail-type=ALL              # Type of email notification- BEGIN,END,FAIL,ALL
+#SBATCH --mail-user=schaturvedi@fas.harvard.edu # Email to send notifications to
+
+source new-modules.sh
+module load hmmer/3.1b1-fasrc01
+
+
+TRANS_DATA=/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate
+TRINOTATE_HOME=/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate
+
+
+hmmscan --cpu 16 --domtblout TrinotatePFAM.out $TRINOTATE_HOME/Pfam-A.hmm $TRANS_DATA/Trinity.fasta.transdecoder.pep > pfam.log
+
+```
+
+>*D. Additional annotations against Uniref90 database*
+
+Trinotate uses a customized version of the Uniref90 database. This can be downloaded from the Trinotate website into the $TRINOTATE_HOME folder created above:
+
+```bash
+wget wget https://data.broadinstitute.org/Trinity/Trinotate_v3_RESOURCES/Trinotate_v2.0_RESOURCES/uniprot_uniref90.trinotate_v2.0.pep.gz
+```
+
+To rename, uncompress and index the Uniref90 database for Blast use:
+
+```bash
+$ mv uniprot_uniref90.trinotate_v2.0.pep.gz uniprot_uniref90.trinotate.pep.gz
+$ gunzip uniprot_uniref90.trinotate.pep.gz
+$ makeblastdb -in uniprot_uniref90.trinotate.pep -dbtype prot
+```
+The Blast indexing should take about 30 minutes.
+
+Break the transcriptome into volumes of 3,000 sequences to runs jobs in parallel, using the split_fasta.pl script (usage: split_fasta.pl ):
+
+```bash
+perl ../split_fasta.pl /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trinity/Trinity_assembly/Trinity.fasta  trinity_phlox.uniref90.vol  3000
+perl ../split_fasta.pl ../Trinity.fasta.transdecoder.pep  transdecoder_phlox.uniref90.vol  3000
+```
+
+Blastx of transcript nucleotide sequences against Uniref90. Run as a SLURM job array in partition "general" for the transcript fasta volumes. The script is:
+
+```bash
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH -n 8
+#SBATCH -p serial_requeue                   # may consider running on a bigmem node for large dataset
+#SBATCH -e blastx_%A_%a.err            # File to which STDERR will be written
+#SBATCH -o blastx_%A_%a.out           # File to which STDOUT will be written
+#SBATCH --array=1-331               # Job name
+#SBATCH --mem=5000                 # Memory requested
+#SBATCH --time=7-00:00              # Runtime in D-HH:MM:SS
+#SBATCH --mail-type=ALL              # Type of email notification- BEGIN,END,FAIL,ALL
+#SBATCH --mail-user=schaturvedi@fas.harvard.edu # Email to send notifications to
+
+source new-modules.sh
+module load blast/2.2.29+-fasrc03
+
+TRANS_DATA=/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate/add_annot
+TRINOTATE_HOME=/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate/add_annot
+
+blastx -query $TRANS_DATA/trinity_phlox.uniref90.vol.${SLURM_ARRAY_TASK_ID}.fasta  -db $TRINOTATE_HOME/uniprot_uniref90.trinotate.pep -num_threads 32 -max_target_seqs 1 -outfmt 6 > blastx_uniref90_vol_${SLURM_ARRAY_TASK_ID}.outfmt6
+
+```
+
+Blastx jobs in this SLURM array took from about a week (not inlcuding any time the jobs may have spent in submission queue, job restarts, etc.).
+
+Concatenate result volumes into a single results file:
+
+```bash
+$ cat blastx_uniref90_vol_*.outfmt6 > blastx_uniref90.outfmt6
+```
+
+Blastp of transcript TransDecoder peptide sequences against Uniref90. Run as a SLURM job array in partition "serial_requeue" for the fasta volumes. The script is:
+
+```bash
+#!/bin/bash
+#SBATCH -N 1
+#SBATCH -n 8
+#SBATCH -p serial_requeue                   # may consider running on a bigmem node for large dataset
+#SBATCH -e blastx_%A_%a.err            # File to which STDERR will be written
+#SBATCH -o blastx_%A_%a.out           # File to which STDOUT will be written
+#SBATCH --array=1-83               # Job name
+#SBATCH --mem=5000                 # Memory requested
+#SBATCH --time=7-00:00              # Runtime in D-HH:MM:SS
+#SBATCH --mail-type=ALL              # Type of email notification- BEGIN,END,FAIL,ALL
+#SBATCH --mail-user=schaturvedi@fas.harvard.edu # Email to send notifications to
+
+source new-modules.sh
+module load blast/2.2.29+-fasrc03
+
+TRANS_DATA=/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate/uniref90_annot
+TRINOTATE_HOME=/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate/uniref90_annot
+
+
+blastp -query $TRANS_DATA/transdecoder_phlox.uniref90.vol.${SLURM_ARRAY_TASK_ID}.fasta  -db $TRINOTATE_HOME/uniprot_uniref90.trinotate.pep -num_threads 32 -max_target_seqs 1 -outfmt 6 > blastp_uniref90_vol_${SLURM_ARRAY_TASK_ID}.outfmt6
+```
+
+Blastp jobs in this SLURM array took from about 8 to 16 hours (not inlcuding any time the jobs may have spent in submission queue, job restarts, etc.).
+
+Concatenate result volumes into a single results file:
+
+```bash
+$ cat blastp_uniref90_vol_*.outfmt6 > blastp_uniref90.outfmt6
+```
+
+>*E. Optional additional annotations*
+
+Other OPTIONAL processing includes running the following programs; they are already installed on Odyssey as Lmod or legacy modules:
+
+- SignalP to predict signal peptides (Lmod module signalp/4.1c-fasrc01)
+- tmHMM to predict transmembrane regions (legacy module hpc/TMHMM2.0c)
+- RNAMMER 1.2 to identify rRNA transcripts (Lmod module rnammer/1.2-fasrc01)
+
+Below is the SLURM script to run these three programs sequentially. Alternatively, they can be run in parallel in three separate SLURM scripts using the same SLURM parameters. Each program would need about 2-4 hours to finish the mouse example dataset (tmHMM takes the longest); altogether they would take 10-12 hours.
+
+```bash
+#!/bin/bash
+#SBATCH -n 1
+#SBATCH -N 1
+#SBATCH --mem 5000
+#SBATCH -p serial_requeue
+#SBATCH -o optional.out
+#SBATCH -e optional.err
+#SBATCH -t 600
+
+source new-modules.sh
+
+
+## Run SignalP to predict signal peptides
+
+module load signalp/4.1c-fasrc01
+
+signalp -f short -n signalp.out Trinity.fasta.transdecoder.pep
+
+
+## Run RNAMMER 1.2 to identify rRNA transcripts
+
+#module load rnammer/1.2-fasrc03
+
+#/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate/Trinotate-2.0.2/util/rnammer_support/RnammerTranscriptome.pl --transcriptome /n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trinity/Trinity_assembly/Trinity.fasta --path_to_rnammer /n/sw/fasrcsw/apps/Core/rnammer/1.2-fasrc02/rnammer
+
+
+## Run tmHMM to predict transmembrane regions
+
+module load gcc/7.1.0-fasrc01 tmhmm/2.0c-fasrc01
+
+tmhmm --short < Trinity.fasta.transdecoder.pep  > tmhmm.out
+```
+**5. Combine search results and create annotation report**
+In the working directory combine the results of the Blast and Pfam searches above into the SQLite database.
+
+Begin populating the SQLite database by loading:
+
+- Transcript nucleotide sequences
+- Peptide sequences (from TransDecoder)
+- Gene/Transcript relationships ("gene_transcript_map.txt" file)
+
+Retrieve and uncompress the latest Trinotate pre-generated resource SQLite database, which contains Uniprot(SwissProt and Uniref90)-related annotation information:
+
+```bash
+wget "https://data.broadinstitute.org/Trinity/Trinotate_v3_RESOURCES/Trinotate_v2.0_RESOURCES/Trinotate.sprot_uniref90.20150131.boilerplate.sqlite.gz" -O Trinotate.sqlite.gz
+gunzip Trinotate.sqlite.gz
+```
+
+```bash
+#Perl modules are needed for this processing. Load with:
+source new-modules.sh
+module load perl-modules/5.10.1-fasrc13
+
+
+TRANS_DATA=/n/holystore01/LABS/hopkins_lab/Lab/schaturvedi/Henry_rnaseq/trinity/Trinity_assembly
+TRINOTATE_HOME=/n/holyscratch01/hopkins_lab/Chaturvedi/rnaseq_analyses/trinotate/Trinotate-2.0.2
+
+#The command to initialize the database is:
+$TRINOTATE_HOME/Trinotate Trinotate.sqlite init --gene_trans_map gene_transcript_map.txt --transcript_fasta $TRANS_DATA/Trinity.fasta --transdecoder_pep Trinity.fasta.transdecoder.pep
+
+#Load Blast results:
+
+$TRINOTATE_HOME/Trinotate Trinotate.sqlite LOAD_swissprot_blastp  ./blastp/blastp_sprot.outfmt6
+$TRINOTATE_HOME/Trinotate Trinotate.sqlite LOAD_swissprot_blastx  ./blastx/blastx_sprot.outfmt6
+
+#OPTIONAL - Load Blast results from Uniref90 searches if you have them:
+
+$TRINOTATE_HOME/Trinotate Trinotate.sqlite LOAD_trembl_blastp  ./uniref90_annot/blastp_uniref90.outfmt6
+$TRINOTATE_HOME/Trinotate Trinotate.sqlite LOAD_trembl_blastx  ./uniref90_annot/blastx_uniref90.outfmt6
+
+#Load Pfam results
+$TRINOTATE_HOME/Trinotate Trinotate.sqlite LOAD_pfam  TrinotatePFAM.out
+
+#OPTIONAL - Load results of additional processing (tmHMM, SignalP, RNAMMER):
+
+
+$TRINOTATE_HOME/Trinotate Trinotate.sqlite LOAD_tmhmm  tmhmm.out
+$TRINOTATE_HOME/Trinotate Trinotate.sqlite LOAD_signalp  signalp.out
+
+```
+
+Each of these database loading commands takes about a minute (or less) to run.
+
+Create annotation report table; a parameter that can be specified is "-E" (maximum E-value for reporting best blast hit and associated annotations); the default value (0.00001) is stringent enough, so that is what is used here:
+
+```bash
+$TRINOTATE_HOME/Trinotate Trinotate.sqlite report -E 0.00001 > trinotate_annotation_report.txt
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

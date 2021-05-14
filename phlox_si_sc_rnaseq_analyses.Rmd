@@ -1,0 +1,620 @@
+---
+title: "Transcriptomic basis of self-incompatibility in *Phlox drummondii*"
+author: "Samridhi Chaturvedi"
+date: "3/18/2021"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.width=15, fig.height=8) 
+library(edgeR)
+library(limma)
+library(Glimma)
+library(gplots)
+#library(org.Mm.eg.db)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(ggvenn)
+library("ggVennDiagram")
+```
+
+## Implementing the RSEM/Limma pipeline
+
+Before one starts a limma voom analysis, one needs to run RSEM on adapter-stripped fastq files, either on RSEM-compatible bam files, or by having RSEM use STAR or bowtie2 to do the alignments with RSEM-specific settings. For studies where a reference genome is available, we do not recommend any quality trimming as there is evidence emerging that quality trimming can bias expression estimates. Adam is in the process of running RSEM with bowtie2 on all of the samples. We can then use one of RSEM’s utility function’s to create the expression matrix, consisting of rows for each observation (transcript or gene), and columns for samples. Assuming one has supplied a gene-to-transcript map when the RSEM index is built, RSEM will output gene-level and transcript (isoform) -level expression estimates. We can then use the gene count matrix for differential expression analyses. This is the matrix I used for the analyses below.
+
+## Reading in the files
+We can now load the expression matrix table. For this exercise, we will conduct analyses at the gene level.
+
+1. Open RSEM matrix which right now has 36518 genes for 26 samples. Also, read in the file with sample information:
+
+```{r fileprep}
+#read in the file with all the counts
+seqdata<-read.table("phlox_unfiltered_starxstringtie_annotation_RSEMxbowtie2_gene_count.matrix", header=T)
+#read in the sample ids to get treatments and lines
+samples<-read.csv("sample_details.csv", header=T)
+#drop the heterospecific samples
+seqdata<-seqdata[,-c(1,22)]
+samples<-samples[-c(1,22),]
+rownames(samples)<-1:nrow(samples)
+rownames(samples)
+#switch the samples which might be wrongly labelled
+samples$pollen_source[5]<-"self"
+samples$pollen_source[8]<-"none"
+samples$development_stage[5]<-"mature"
+samples$development_stage[8]<-"immature"
+#rename the columns of seqdata with sample ids
+colnames(seqdata)<-samples$sample_id
+table(samples$pollen_source)
+table(samples$development_stage)
+#rename samples to have line and host in the names
+newids<-interaction(samples$sample_id, samples$compatibility, samples$pollen_source, samples$development_stage)
+colnames(seqdata)<-newids
+#head(seqdata)
+```
+
+## Pre-processing and filtering
+RSEM uses a generative model of RNA-seq and Expectation-Maximization to generate “expected counts” in a way that also uses multi-mapping reads, and their associated mapping uncertainty with, e.g. if reads map to exons shared between transcripts of a gene. As a result, values will be non-integer but almost all DE tools work with counts. Thus, our first step is to round the matrix.
+
+2. Round the expression matrix
+
+```{r round}
+countdata=round(seqdata)
+head(countdata)
+```
+
+A number of transcripts will be not expressed at all in any sample, or may only be expressed in a small number of samples. In the latter case, testing for differential expression is noisy and under-powered. A common approach is to require that at least one condition shows evidence for expression. It should be noted that optimal choice of filtering threshold remains a work in progress. I have been playing around with the threshold for a minimum level of expression for the number of samples equivalent to the condition with the smallest number of samples.In our case, if we are compoaring between pollen treatments, the number of samples will be 6.  I have filtered genes in two ways: 1). I am filtering lowly expressed genes such that I remove any gene with count values less than 0.5. 2). I would retain genes with based on the minimum number of genes across all 24 samples - this can be manipulated and played with but I have gone with the strictest level here by choosing all 6 samples. Or we can go with 12 samples - based on SI and SC
+
+3. Create a boolean variable that classifies samples according to whether CPM >= 0.5:
+
+```{r filter1}
+# Which values in CPM are greater than 0.5?
+thresh <- countdata > 0.5
+# This produces a logical matrix with TRUEs and FALSEs
+# Summary of how many TRUEs there are in each row
+table(rowSums(thresh))
+# we would like to keep genes that have at least 24 TRUES in each row of thresh, at 25 we lose all genes
+keep <- rowSums(thresh) >= 12
+```
+
+4. Apply the filter to the expression matrix:
+
+```{r filter2}
+# Subset the rows of countdata to keep the more highly expressed genes
+counts.keep <- countdata[keep,]
+summary(keep)
+dim(counts.keep)
+```
+
+This operation filters out ~6000 genes, which reduces our multiple testing burden as well (although limma might not actually try and conduct tests on a subset of these).
+
+```{r percent}
+100*(1-dim(counts.keep)[1]/dim(seqdata)[1])
+```
+Thus, ~16% of the genes are filtered out prior to DE analyses.
+
+## Creating a Digital Gene Expression list object 
+To run limma, we need to transform the expression matrix into a DGElist (“digital gene expression list”) which is an object class that comes from edgeR
+
+5. Create the DGE object and normalized expression matrix:
+```{r dge}
+DGE<-DGEList(counts.keep)
+table(rowSums(DGE$counts==0)==24)
+```
+
+The next step is conducting normalization of the counts across samples so that library size differences and the effects of genes that are highly expressed and sample specific are accounted for. Regarding the latter, we want to avoid having a few genes take up excess sequencing “real estate” given the overall number of reads generated by a sample, such that it reduces the reads in other transcripts in a way that would lead to false positive DE. To do this, I am using the trimmed mean of M-values (TMM) of Robinson and Oshlack (2010) available in edgeR. Note, one can use other normalization schemes, and I have seen some evidence that conditional quantile normalization (CQN) might be worth considering as an alternative.
+
+6. Calculate normalization factors:
+```{r dgenorm}
+DGE<-calcNormFactors(DGE,method =c("TMM"))
+cutoff <- 1
+drop <- which(apply(cpm(DGE), 1, max) < cutoff)
+DGE_f <- DGE[-drop,] 
+dim(DGE_f)
+
+keep.exprs <- filterByExpr(DGE_f)
+x <- DGE_f[keep.exprs, keep.lib.sizes=FALSE]
+dim(x)
+# Library size information is stored in the samples slot
+#x$samples
+x$samples$compatibility<-samples$compatibility
+x$samples$pollen<-samples$pollen_source
+x$samples$devstage<-samples$development_stage
+```
+
+7. Then, I did a quick MDS plot to see if there are any outliers:
+
+```{r mds1, fig.height = 13, fig.width = 8}
+#read in the sample detail file
+col_pd<-c("green","lightpink","darkblue","magenta","magenta","lightpink","darkblue","green","green","lightpink","darkblue","magenta","green","lightpink","darkblue","magenta","green","lightpink","darkblue","magenta","green","lightpink","darkblue","magenta")
+#plot
+#title: MDS plots of log-CPM values over dimensions 1 and 2 with samples coloured and labeled by sample groups (A) and over dimensions 3 and 4 with samples coloured and labeled by sequencing lane (B).Distances on the plot correspond to the leading fold-change, which is the average (root-mean-square) log2-fold-change for the 500 genes most divergent between each pair of samples by default.
+#par(mfrow=c(2,1))
+pdf("mdsplot_allsamples.pdf", width=8, height=8)
+par(mar=c(5,5,5,5))
+plotMDS(x, col="black",bg=col_pd, pch=c(24,21)[as.factor(samples$compatibility)], cex=3, ylim=c(-4,4), cex.lab=1.5)
+legend("topleft", legend=c(c("IMnone","Mout","Mself","IMself"),levels(as.factor(samples$compatibility))),pch=c(rep(15,4),2,1), col=c("green","darkblue","magenta","lightpink","black","black"),ncol=2, cex=1)
+#title("A. Compatibility x Pollen source", adj = 0.5, cex.main=2)
+dev.off()
+```
+
+## DE analysis
+
+**1. Removing pollen genes based on expression (Expression check: All genes that are expressed in the SI-None-Ima and SC-None-Ima are pistil genes)**
+
+```{r model0}
+dev<-as.factor(x$samples$devstage)
+DGE_imm<-x[,which(dev == "immature")]
+samples_imm<-samples[which(samples$development_stage == "immature"),]
+ipollen<-as.factor(DGE_imm$samples$pollen)
+icomp<-as.factor(DGE_imm$samples$compatibility)
+
+#create design matrix
+design0<-model.matrix(~0+ipollen)
+design0
+
+#voom transformation
+v0 <- voom(DGE_imm, design=design0)
+#fit linear model
+fit0=lmFit(v0,design0)
+fit0<-eBayes(fit0)
+#get summary
+dt0<-decideTests(fit0, adjust.method = "fdr", p.value=0.05) #Using FDR corrections across contrasts
+summary(dt0)
+
+```
+
+```{r venn1}
+pollen_com <- which(dt0[,1]!=0 & dt0[,2]!=0)
+length(pollen_com) #18182
+#pdf("venn_self_none_immature.pdf", width=10, height=8)
+par(mar=c(2,2,2,2))
+vennDiagram(dt0[,c(2,1)], circle.col=c("pink", "blue"), names = c("Immature-self","Immature-none"), cex=2)
+#dev.off()
+```
+
+ - So based on this design there are 18182 genes which overlap between the two pollen groups: these could be possible pistil genes.
+ - There are 748 genes in the Immature-self treatment which do not overlap with the Immature-none treatment: these could be possible pollen genes or genes activated by pollen treatment.
+ - There are 586 genes in the Immature-none treatment which do not overlap with the Immature-self treatment: these are only pistil genes (but perhaps I am confounding some effect of compatibility?). 
+
+*I have not dropped these genes from the analyses below but this was a test and I can confirm this by using genotypes and then drop them.*
+
+**2. Highest expressed genes are SI recognition **
+•	Compare the highest expressed genes in SISMat+SIOMat vs. SISIma +SINIma (Not done this)
+•	Compare the most differentially expressed genes between SISMat+SIOMat vs. SISIma +SINIma
+
+```{r model1b}
+comp<-as.factor(x$samples$compatibility)
+DGE_si<-x[,which(comp == "SI")]
+pollen1<-as.factor(DGE_si$samples$pollen)
+comp1<-as.factor(DGE_si$samples$compatibility)
+dev1<-as.factor(DGE_si$samples$devstage)
+si_m<-c(0,0,1,1,0,0,1,1,0,0,1,1)
+si_im<-c(1,1,0,0,1,1,0,0,1,1,0,0)
+
+#create design matrix
+design1b<-model.matrix(~0+si_m+si_im)
+design1b
+
+#voom transformation
+v1b <- voom(DGE_si, design=design1b)
+
+#create the contrast matrix
+contr.matrix1b<-makeContrasts(
+  SImat_SIimm <- si_m-si_im,
+  levels = design1b
+)
+
+#fit linear model
+fit1b=lmFit(v1b,design1b)
+#Compute contrast
+fit_contrasts1b<-contrasts.fit(fit1b, contr.matrix1b)
+#Bayes statistics of differential expression
+fit_contrasts1b<-eBayes(fit_contrasts1b)
+#get summary
+dt1b<-decideTests(fit_contrasts1b, adjust.method = "fdr", p.value=0.05) #Using FDR corrections across contrasts
+summary(dt1b)
+```
+
+**There are no differentially expressed genes for this contrast**
+
+•	Check if these are the same or overlapping when comparing with SCSMat +SCOMat vs. SCSIma +SCNIma
+```{r model1c}
+comp<-as.factor(x$samples$compatibility)
+DGE_sc<-x[,which(comp == "SC")]
+pollen1<-as.factor(DGE_sc$samples$pollen)
+comp1<-as.factor(DGE_sc$samples$compatibility)
+dev1<-as.factor(DGE_sc$samples$devstage)
+sc_m<-c(0,0,1,1,1,0,1,0,0,0,1,1)
+sc_im<-c(1,1,0,0,0,1,0,1,1,1,0,0)
+
+#create design matrix
+design1c<-model.matrix(~0+sc_m+sc_im)
+design1c
+
+#voom transformation
+v1c <- voom(DGE_sc, design=design1c)
+#fit linear model
+fit1c=lmFit(v1c,design1c)
+#create the contrast matrix
+contr.matrix1c<-makeContrasts(
+  SCmat_SCimm <- sc_m-sc_im,
+  levels = design1c
+)
+
+#fit linear model
+fit1c=lmFit(v1c,design1c)
+#Compute contrast
+fit_contrasts1c<-contrasts.fit(fit1c, contr.matrix1c)
+#Bayes statistics of differential expression
+fit_contrasts1c<-eBayes(fit_contrasts1c)
+#get summary
+dt1c<-decideTests(fit_contrasts1c, adjust.method = "fdr", p.value=0.05) #Using FDR corrections across contrasts
+summary(dt1c)
+
+#compare of these are the same as the comparison of SI genes above
+#dt1b_genes<-rownames(dt1b)[which(dt1b[,1]!=0 & dt1b[,2]!=0)] #18564
+#dt1c_genes<-rownames(dt1c)[which(dt1c[,1]!=0 & dt1c[,2]!=0)] #17736
+#common<-dt1b_genes[which(dt1b_genes %in% dt1c_genes)]
+#length(common) 
+
+```
+**There are no differentially expressed genes for this contrast**
+
+**3. Self rejection response genes (At least some aspects of the full self-rejection response will be unique to the SI-S-Mat treatment)**
+**First compare SISMat vs SIOMat – these are all the possible genes in the self vs. nonself recognition response**
+
+Pairwise comparison model:
+
+```{r model2a}
+# subset samples
+dev<-as.factor(x$samples$devstage)
+DGE_mat<-x[,which(dev == "mature")]
+samples_mat<-samples[which(samples$development_stage == "mature"),]
+pollen<-as.factor(DGE_mat$samples$pollen)
+comp<-as.factor(DGE_mat$samples$compatibility)
+groupcp3<-interaction(comp,pollen)
+
+#create a design matrix
+design3<-model.matrix(~0+groupcp3)
+#assign column names
+colnames(design3) <- gsub("groupcp3", "", colnames(design3))
+#check matrix
+#design3
+
+#voom transform matrix and check the plot
+v3 <- voom(DGE_mat, design=design3)
+
+#create the contrast matrix
+contr.matrix3<-makeContrasts(
+  SIself_SIout <- SI.self-SI.outcross,
+  SIself_SCself <- SI.self-SC.self,
+  SIself_SCout <- SI.self-SC.outcross,
+  SCself_SCout <- SC.self-SC.outcross,
+  levels = design3
+)
+
+#Fit the voom transformed expression matrix to a linear model
+fit3=lmFit(v3,design3)
+#Compute contrast
+fit_contrasts3<-contrasts.fit(fit3, contr.matrix3)
+#Bayes statistics of differential expression
+fit_contrasts3<-eBayes(fit_contrasts3)
+#Summary of results (number of differentially expressed genes)
+dt3 <- decideTests(fit_contrasts3, method = "separate", p.value=0.05)
+summary(dt3)
+
+#get number of DE genes for each contrast
+length(rownames(dt3)[which(dt3[,1]!=0)])
+length(rownames(dt3)[which(dt3[,2]!=0)])
+length(rownames(dt3)[which(dt3[,3]!=0)])
+length(rownames(dt3)[which(dt3[,4]!=0)])
+
+#Generate a vocalno plot to visualize differential expression
+#volcanoplot(fit_contrasts3)
+#Generate a list of top 100 differentially expressed genes
+#top_genes <- topTable(fit_contrasts3, number = 100, adjust = "BH")
+
+```
+
+**1. There are no DE genes between SI.self vs. SI.outcross or SC.self vs. SC.outcross**
+**2. There are 133 DE genes between SI.self vs. SC.self and 235 DE genes between SI.self vs. SC.outcross**
+
+
+3 - way comparison model:
+
+```{r model2b}
+
+#drop SC-self samples from the expression matrix
+# mature
+dev<-as.factor(x$samples$devstage)
+DGE_mat<-x[,which(dev == "mature")]
+#drop SC-self samples
+DGE_mat_s<-DGE_mat[,-c(2,3,6)]
+#drop samples from group
+siself<-c(0,0,0,0,1,0,1,0,1)
+other<-c(1,1,1,1,0,1,0,1,0)
+#create a design matrix
+design4<-model.matrix(~0+siself+other)
+#check matrix
+design4
+
+#voom transform matrix and check the plot
+v4 <- voom(DGE_mat_s, design=design4)
+
+#create the contrast matrix
+contr.matrix4<-makeContrasts(
+  SIself_others <- siself-other,
+  levels = design4
+)
+
+#Fit the voom transformed expression matrix to a linear model
+fit4=lmFit(v4,design4)
+#Compute contrast
+fit_contrasts4<-contrasts.fit(fit4, contr.matrix4)
+#Bayes statistics of differential expression
+fit_contrasts4<-eBayes(fit_contrasts4)
+#Summary of results (number of differentially expressed genes)
+dt4 <- decideTests(fit_contrasts4, method = "separate", p.value=0.05)
+summary(dt4)
+
+#get number of DE genes for each contrast
+#length(rownames(dt3)[which(dt3[,1]!=0)])
+#length(rownames(dt3)[which(dt3[,2]!=0)])
+#length(rownames(dt3)[which(dt3[,3]!=0)])
+#length(rownames(dt3)[which(dt3[,4]!=0)])
+
+#Generate a vocalno plot to visualize differential expression
+#volcanoplot(fit_contrasts3)
+#Generate a list of top 100 differentially expressed genes
+#top_genes <- topTable(fit_contrasts3, number = 100, adjust = "BH")
+
+```
+
+**Again, I see not genes DE for this 3-way comparison.**
+
+MDS Plot for only mature samples:
+
+```{r mds2}
+colors<-c(rep("#fa9fb5",23),rep("#c51b8a",24))
+library(jcolors)
+colors_pollen<-c(jcolors(palette = "pal5")[2:3],"black","black")
+#pdf("mdsplot_mature.pdf")
+par(mar=c(5,8,8,2))
+plotMDS(DGE_mat, col="black",bg=colors_pollen[as.factor(samples_mat$pollen_source)], pch=c(24,21)[as.factor(samples_mat$compatibility)], cex=3, ylim=c(-4,4), cex.lab=3, cex.axis=2)
+legend("bottomleft", legend=c(levels(as.factor(samples_mat$pollen_source)),levels(as.factor(samples_mat$compatibility))),pch=c(rep(15,2),2,1), col=colors_pollen,ncol=2, cex=1)
+#dev.off()
+```
+
+**4. What is broken with self-compatible response?**
+Compare SCSMat vs. SISMat. Are these differentially expressed genes
+- Yes, there are 133 differentially expressed genes between SCSMat and SISMat.
+
+o	Overlapping with the DE genes from the SISMat Vs. SIOMat comparison (indicating that SC is a broken SI mechanisms that does not cause the incompatibility response?)
+- There are not DE genes between SISMat and SIOMat. So there is no overlap between the two comparisons.
+
+o	And or overlapping with the DE genes from the SISImat vs. SISMat comparison indicating that maybe the recognition system is also broken in the SC plants.
+- There is just one gene which is DE for this comparison and this does not overlap with SISMat vs SCSMat.
+
+```{r model3a}
+#compare SI-self-mature vs SI-self-immature
+#drop SC-self samples from the expression matrix
+comp5<-as.factor(x$samples$compatibility)
+pollen5<-as.factor(x$samples$pollen)
+# mature
+DGE_si<-x[,which(comp5 == "SI")]
+pollen<-DGE_si$samples$pollen
+dev<-DGE_si$samples$devstage
+groupcp5<-interaction(dev,pollen)
+
+#create a design matrix
+design5<-model.matrix(~0+groupcp5)
+colnames(design5) <- gsub("groupcp5", "", colnames(design5))
+#check matrix
+design5
+
+#voom transform matrix and check the plot
+v5 <- voom(DGE_si, design=design5, plot=TRUE)
+
+#create the contrast matrix
+contr.matrix5<-makeContrasts(
+  SISMat_SISImat <- mature.self-immature.self,
+  levels = design5
+)
+
+#Fit the voom transformed expression matrix to a linear model
+fit5=lmFit(v5,design5)
+#Compute contrast
+fit_contrasts5<-contrasts.fit(fit5, contr.matrix5)
+#Bayes statistics of differential expression
+fit_contrasts5<-eBayes(fit_contrasts5)
+#Summary of results (number of differentially expressed genes)
+dt5 <- decideTests(fit_contrasts5, method = "separate", p.value=0.05)
+summary(dt5)
+
+#check if this gene overlaps with SCSMat vs. SISMat
+rownames(dt5)[which(dt5[,1] != 0)] #"MSTRG.15564"
+rownames(dt3)[which(dt3[,2] != 0)]
+which(rownames(dt3)[which(dt3[,2] != 0)] == "MSTRG.15564") #does not overlap
+```
+
+**Is the difference between SC and SI always expressed or just a response to self-pollen? Compare SCSMat +SCOMat Vs. SISMat +SIOMat. These DE genes are always different between SI and SC regardless of pollen added. - There are 2326 DE genes for this comparison.**
+
+```{r model3b}
+
+#drop SC-self samples from the expression matrix
+# mature
+dev<-as.factor(x$samples$devstage)
+DGE_mat<-x[,which(dev == "mature")]
+#create a design matrix
+design6<-model.matrix(~0+DGE_mat$samples$compatibility)
+colnames(design6)<-c("SC","SI")
+#check matrix
+design6
+
+#voom transform matrix and check the plot
+v6 <- voom(DGE_mat, design=design6, plot=TRUE)
+
+#create the contrast matrix
+contr.matrix6<-makeContrasts(
+  SC_SI <- SC-SI,
+  levels = design6
+)
+
+#Fit the voom transformed expression matrix to a linear model
+fit6=lmFit(v6,design6)
+#Compute contrast
+fit_contrasts6<-contrasts.fit(fit6, contr.matrix6)
+#Bayes statistics of differential expression
+fit_contrasts6<-eBayes(fit_contrasts6)
+#Summary of results (number of differentially expressed genes)
+dt6 <- decideTests(fit_contrasts6, method = "separate", p.value=0.05)
+summary(dt6)
+
+#get number of DE genes for each contrast
+#length(rownames(dt3)[which(dt3[,1]!=0)])
+#length(rownames(dt3)[which(dt3[,2]!=0)])
+#length(rownames(dt3)[which(dt3[,3]!=0)])
+#length(rownames(dt3)[which(dt3[,4]!=0)])
+
+#Generate a vocalno plot to visualize differential expression
+#volcanoplot(fit_contrasts3)
+#Generate a list of top 100 differentially expressed genes
+#top_genes <- topTable(fit_contrasts3, number = 100, adjust = "BH")
+
+```
+•	Follow up – check if these are the same or different genes that are differentially expressed between SISMat +SIOMat vs. SISImat +SINImat comparision – if these are the same genes it would strongly indicate the recognition system if changed in the SC plants (I will come back to this.)
+
+**Suggestions from Robin in April 2021**
+
+```{r model1b}
+DGE_mat<-x[,which(devmat == "mature")]
+comp<-as.factor(DGE_mat$samples$compatibility)
+
+#### Compare Mature SI and SC - all of them ####
+#create design matrix
+design_comp<-model.matrix(~0+comp)
+design_comp
+
+#voom transformation
+v_comp <- voom(DGE_mat, design=design_comp)
+
+#create the contrast matrix
+contr.matrix.comp<-makeContrasts(
+  SCmat_SImat <- compSC-compSI,
+  levels = design_comp
+)
+
+#fit linear model
+fit_comp=lmFit(v_comp,design_comp)
+#Compute contrast
+fit_contrasts_comp<-contrasts.fit(fit_comp, contr.matrix.comp)
+#Bayes statistics of differential expression
+fit_contrasts_comp<-eBayes(fit_contrasts_comp)
+#get summary
+dt_comp<-decideTests(fit_contrasts_comp, adjust.method = "fdr", p.value=0.05) #Using FDR corrections across contrasts
+summary(dt_comp)
+
+######## Outcross SC and outcross SI - mature #######
+DGE_out<-DGE_mat[,which(DGE_mat$samples$pollen == "outcross")]
+comp<-as.factor(DGE_out$samples$compatibility)
+
+#create design matrix
+design_out<-model.matrix(~0+comp)
+design_out
+
+#voom transformation
+v_out <- voom(DGE_out, design=design_out)
+
+#create the contrast matrix
+contr.matrix.out<-makeContrasts(
+  SCout_SIout <- compSC-compSI,
+  levels = design_out
+)
+
+#fit linear model
+fit_out=lmFit(v_out,design_out)
+#Compute contrast
+fit_contrasts_out<-contrasts.fit(fit_out, contr.matrix.out)
+#Bayes statistics of differential expression
+fit_contrasts_out<-eBayes(fit_contrasts_out)
+#get summary
+dt_out<-decideTests(fit_contrasts_out, adjust.method = "fdr", p.value=0.05) #Using FDR corrections across contrasts
+summary(dt_out)
+
+#### Self SC and self SI - mature #####
+DGE_self<-DGE_mat[,which(DGE_mat$samples$pollen == "self")]
+comp<-as.factor(DGE_self$samples$compatibility)
+
+#create design matrix
+design_self<-model.matrix(~0+comp)
+design_self
+
+#voom transformation
+v_self <- voom(DGE_self, design=design_self)
+
+#create the contrast matrix
+contr.matrix.self<-makeContrasts(
+  SCself_SIself <- compSC-compSI,
+  levels = design_self
+)
+
+#fit linear model
+fit_self=lmFit(v_self,design_self)
+#Compute contrast
+fit_contrasts_self<-contrasts.fit(fit_self, contr.matrix.self)
+#Bayes statistics of differential expression
+fit_contrasts_self<-eBayes(fit_contrasts_self)
+#get summary
+dt_self<-decideTests(fit_contrasts_self, adjust.method = "fdr", p.value=0.05) #Using FDR corrections across contrasts
+summary(dt_self)
+
+#check overlap
+
+
+```
+
+
+
+#extra
+
+**Therefore, I did another design where I made pairwise comparisons and then checked for overlap.
+ Create a design matrix:**
+
+In this second design, I first compared immature SI samples with self pollen vs. immature SC samples with self pollen. Second, I compared immature SI samples with no pollen vs. immature SC samples with no pollen. I then checked for any overlap between these groups.
+
+```{r dmat1}
+groupcp<-interaction(icomp,ipollen)
+design2<-model.matrix(~0+groupcp)
+#colnames(design) <- gsub("groupcp", "", colnames(design))
+design2
+```
+
+After creating the design matrix object, the standard approach is to next run limma voom on the DGE object, e.g.:
+
+```{r voom2}
+v2 <- voom(DGE_imm, design=design2)
+fit2=lmFit(v2,design2)
+fit2=eBayes(fit2,robust=TRUE)
+```
+
+```{r conmat2}
+#create contrast matrix
+contr.matrix2<-makeContrasts(
+  iSIself<-groupcpSI.self,
+  iSCself<-groupcpSC.self,
+  iSInone<-groupcpSI.none,
+  iSCnone<-groupcpSC.none,
+  levels = design2
+)
+#fit these contrasts
+fit_contrasts2<-contrasts.fit(fit2, contr.matrix2)
+fit_contrasts2<-eBayes(fit_contrasts2)
+#get summary
+global_dTest_2<-decideTests(fit_contrasts2, adjust.method = "fdr", p.value=0.05) #Using FDR corrections across contrasts
+summary(global_dTest_2)
+```

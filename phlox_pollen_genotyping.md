@@ -107,13 +107,7 @@ write.table(diff_gt_ais_ain[,c(1:2)], "pollen_genotype_vars.txt", col.names=T, r
 **STEP 4: Associating variants with genes**
 The variants from the list above have a chromosome ID and a position on the chromosome where the variant maps. However, for the actual gene expression analyses, ideally we should have a transcript ID with a start and stop position on the genome. Therefore, we need to find the gene on which the variant lies to conclude that it is a pollen gene.
 
-I used the following script associate the variants with the genes: create_snp_annotations.py. We can run this script on the start or stop position of the transcripts to make sure that the variant is in the correct range of the positions.
-
-I used only the scaffold and start or scaffold and stop position from the scafs_transcriptids.txt file to run this annotation.
-
-python create_snp_annotations.py --map transcripts_start --ann genome_annotation.txt --out out_transcripts_start
-python create_snp_annotations.py --map transcripts_stop --ann genome_annotation.txt --out out_transcripts_stop
-
+I have different version of python scripts to get this information but these can be customized based on the final data file we have when we rerun the analyses.
 
 
 
